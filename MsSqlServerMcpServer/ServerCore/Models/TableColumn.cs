@@ -9,4 +9,7 @@ public class TableColumn
     public byte? NumericPrecision { get; set; }
     public int? NumericScale { get; set; }
     public string? DefaultValue { get; set; }
+    
+    // New property to indicate if this column contains sensitive data
+    public bool IsSensitive { get; set; }
 }

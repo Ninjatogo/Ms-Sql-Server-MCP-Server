@@ -1,10 +1,10 @@
-﻿using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Configuration;
+﻿using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Primitives;
 using ServerCore.Interfaces;
 using ServerCore.Services;
 
-namespace ServerCore.Extensions;
+namespace ServerCore;
 
 public static class ServiceCollectionExtensions
 {
@@ -23,7 +23,7 @@ public static class ServiceCollectionExtensions
             throw new ArgumentException("DefaultConnection string is required in configuration");
         }
 
-        services.AddScoped<IDatabaseService, DatabaseService>();
+        services.AddScoped<IDatabaseService, DatabaseServiceBase>();
         return services;
     }
 
@@ -47,7 +47,7 @@ public static class ServiceCollectionExtensions
         var configurationWrapper = new ConfigurationWrapper(configuration, connectionStringName);
         
         services.AddScoped<IDatabaseService>(provider => 
-            new DatabaseService(configurationWrapper, provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<DatabaseService>>()));
+            new DatabaseServiceBase(configurationWrapper, provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<DatabaseServiceBase>>(), provider.GetRequiredService<IPiiFilterService>()));
         
         return services;
     }

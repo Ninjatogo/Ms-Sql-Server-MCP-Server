@@ -7,12 +7,28 @@ using ServerCore.Models;
 
 namespace ServerCore.Services;
 
-public class DatabaseService(IConfiguration configuration, ILogger<DatabaseService> logger)
-    : IDatabaseService
+public partial class DatabaseServiceBase : IDatabaseService
 {
+    private readonly IConfiguration _configuration;
+    private readonly ILogger<DatabaseServiceBase> _logger;
+    private readonly IPiiFilterService _piiFilterService;
+
+    /// <summary>
+    /// Partial class implementing Core Query Capabilities for the DatabaseService
+    /// These methods provide advanced query analysis, validation, and execution features
+    /// </summary>
+    public DatabaseServiceBase(IConfiguration configuration, 
+        ILogger<DatabaseServiceBase> logger,
+        IPiiFilterService piiFilterService)
+    {
+        _configuration = configuration;
+        _logger = logger;
+        _piiFilterService = piiFilterService;
+    }
+
     private string GetConnectionString(string? database = null)
     {
-        var baseConnectionString = configuration.GetConnectionString("DefaultConnection") 
+        var baseConnectionString = _configuration.GetConnectionString("DefaultConnection") 
             ?? throw new InvalidOperationException("DefaultConnection string not found in configuration");
 
         if (!string.IsNullOrEmpty(database))
@@ -50,12 +66,12 @@ public class DatabaseService(IConfiguration configuration, ILogger<DatabaseServi
                 databases.Add(reader.GetString(0));
             }
 
-            logger.LogInformation("Retrieved {Count} databases", databases.Count);
+            _logger.LogInformation("Retrieved {Count} databases", databases.Count);
             return databases;
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "Error retrieving databases");
+            _logger.LogError(ex, "Error retrieving databases");
             throw;
         }
     }
@@ -83,13 +99,13 @@ public class DatabaseService(IConfiguration configuration, ILogger<DatabaseServi
                 tables.Add(reader.GetString(0));
             }
 
-            logger.LogInformation("Retrieved {Count} tables from database {Database}", 
+            _logger.LogInformation("Retrieved {Count} tables from database {Database}", 
                 tables.Count, database ?? "default");
             return tables;
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "Error retrieving tables from database {Database}", database);
+            _logger.LogError(ex, "Error retrieving tables from database {Database}", database);
             throw;
         }
     }
@@ -122,25 +138,37 @@ public class DatabaseService(IConfiguration configuration, ILogger<DatabaseServi
             var columns = new List<TableColumn>();
             while (await reader.ReadAsync())
             {
-                columns.Add(new TableColumn
+                var columnName = reader.GetString("COLUMN_NAME");
+                var column = new TableColumn
                 {
-                    ColumnName = reader.GetString("COLUMN_NAME"),
+                    ColumnName = columnName,
                     DataType = reader.GetString("DATA_TYPE"),
                     IsNullable = reader.GetString("IS_NULLABLE") == "YES",
-                    MaxLength = reader.IsDBNull("CHARACTER_MAXIMUM_LENGTH") ? null : reader.GetInt32("CHARACTER_MAXIMUM_LENGTH"),
+                    MaxLength = reader.IsDBNull("CHARACTER_MAXIMUM_LENGTH") ? null : GetSafeInt32(reader, "CHARACTER_MAXIMUM_LENGTH"),
                     NumericPrecision = reader.IsDBNull("NUMERIC_PRECISION") ? null : reader.GetByte("NUMERIC_PRECISION"),
-                    NumericScale = reader.IsDBNull("NUMERIC_SCALE") ? null : reader.GetInt32("NUMERIC_SCALE"),
-                    DefaultValue = reader.IsDBNull("COLUMN_DEFAULT") ? null : reader.GetString("COLUMN_DEFAULT")
-                });
+                    NumericScale = reader.IsDBNull("NUMERIC_SCALE") ? null : GetSafeInt32(reader, "NUMERIC_SCALE"),
+                    DefaultValue = reader.IsDBNull("COLUMN_DEFAULT") ? null : reader.GetString("COLUMN_DEFAULT"),
+                    IsSensitive = _piiFilterService.IsSensitiveColumn(columnName) // Mark sensitive columns
+                };
+                
+                columns.Add(column);
             }
 
-            logger.LogInformation("Retrieved schema for table {TableName} with {Count} columns", 
+            _logger.LogInformation("Retrieved schema for table {TableName} with {Count} columns", 
                 tableName, columns.Count);
+            
+            var sensitiveCount = columns.Count(c => c.IsSensitive);
+            if (sensitiveCount > 0)
+            {
+                _logger.LogWarning("Table {TableName} contains {SensitiveCount} potentially sensitive columns", 
+                    tableName, sensitiveCount);
+            }
+            
             return columns;
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "Error retrieving schema for table {TableName} in database {Database}", 
+            _logger.LogError(ex, "Error retrieving schema for table {TableName} in database {Database}", 
                 tableName, database);
             throw;
         }
@@ -178,21 +206,24 @@ public class DatabaseService(IConfiguration configuration, ILogger<DatabaseServi
                 rowCount++;
             }
 
+            // Apply PII filtering to the results
+            var filteredRows = _piiFilterService.FilterRows(rows);
+
             var result = new DatabaseQueryResult
             {
                 Success = true,
                 Columns = columns,
-                Rows = rows,
+                Rows = filteredRows, // Use filtered rows instead of original
                 RowCount = rowCount,
-                Message = rowCount >= maxRows ? $"Results limited to {maxRows} rows" : $"Retrieved {rowCount} rows"
+                Message = rowCount >= maxRows ? $"Results limited to {maxRows} rows (PII filtered)" : $"Retrieved {rowCount} rows (PII filtered)"
             };
 
-            logger.LogInformation("Executed query successfully, returned {Count} rows", rowCount);
+            _logger.LogInformation("Executed query successfully, returned {Count} rows with PII filtering applied", rowCount);
             return result;
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "Error executing query: {Query}", query);
+            _logger.LogError(ex, "Error executing query: {Query}", query);
             return new DatabaseQueryResult
             {
                 Success = false,
@@ -225,12 +256,12 @@ public class DatabaseService(IConfiguration configuration, ILogger<DatabaseServi
                 RowCount = rowsAffected
             };
 
-            logger.LogInformation("Executed non-query command successfully, {RowsAffected} rows affected", rowsAffected);
+            _logger.LogInformation("Executed non-query command successfully, {RowsAffected} rows affected", rowsAffected);
             return result;
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "Error executing non-query command: {Command}", command);
+            _logger.LogError(ex, "Error executing non-query command: {Command}", command);
             return new DatabaseQueryResult
             {
                 Success = false,
@@ -240,5 +271,71 @@ public class DatabaseService(IConfiguration configuration, ILogger<DatabaseServi
                 RowCount = 0
             };
         }
+    }
+    
+    /// <summary>
+    /// Safe method to get decimal value from SqlDataReader with proper type conversion
+    /// </summary>
+    private static decimal GetSafeDecimal(SqlDataReader reader, string columnName)
+    {
+        if (reader.IsDBNull(columnName))
+            return 0;
+
+        var value = reader[columnName];
+        return value switch
+        {
+            decimal d => d,
+            double dbl => (decimal)dbl,
+            float f => (decimal)f,
+            long l => l,
+            int i => i,
+            short s => s,
+            byte b => b,
+            _ => Convert.ToDecimal(value)
+        };
+    }
+
+    /// <summary>
+    /// Safe method to get int32 value from SqlDataReader with proper type conversion
+    /// </summary>
+    private static int GetSafeInt32(SqlDataReader reader, string columnName)
+    {
+        if (reader.IsDBNull(columnName))
+            return 0;
+
+        var value = reader[columnName];
+        return value switch
+        {
+            int i => i,
+            long l => (int)l,
+            short s => s,
+            byte b => b,
+            decimal d => (int)d,
+            double dbl => (int)dbl,
+            float f => (int)f,
+            _ => Convert.ToInt32(value)
+        };
+    }
+
+    /// <summary>
+    /// Safe method to get int64 value from SqlDataReader with proper type conversion
+    /// </summary>
+    private static long GetSafeInt64(SqlDataReader reader, string columnName)
+    {
+        if (reader.IsDBNull(columnName))
+            return 0;
+
+        var value = reader[columnName];
+        return value switch
+        {
+            long l => l,
+            int i => i,
+            short s => s,
+            byte b => b,
+            decimal d => (long)d,
+            double dbl => (long)dbl,
+            float f => (long)f,
+            _ => Convert.ToInt64(value)
+        };
     }
 }
