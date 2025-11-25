@@ -1,5 +1,6 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.Text.RegularExpressions;
+using Dapper;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Logging;
 using ServerCore.Models;
@@ -7,13 +8,13 @@ using ServerCore.Models;
 namespace ServerCore.Services;
 
 /// <summary>
-/// Partial class implementing Core Query Capabilities for the DatabaseService
-/// These methods provide advanced query analysis, validation, and execution features
+///     Partial class implementing Core Query Capabilities for the DatabaseService
+///     These methods provide advanced query analysis, validation, and execution features
 /// </summary>
 public partial class DatabaseServiceBase
 {
     /// <summary>
-    /// Get the execution plan for a query to help with performance analysis
+    ///     Get the execution plan for a query to help with performance analysis
     /// </summary>
     /// <param name="query">The SQL query to analyze</param>
     /// <param name="database">Optional database name</param>
@@ -25,18 +26,14 @@ public partial class DatabaseServiceBase
             // Validate that this is a SELECT query for safety
             var safetyCheck = await ValidateQuerySafetyAsync(query);
             if (!safetyCheck.IsSafe)
-            {
                 return new QueryPlanResult
                 {
                     Success = false,
                     Message = $"Query safety validation failed: {safetyCheck.Message}",
                     Query = query
                 };
-            }
 
-            using var connection = new SqlConnection(GetConnectionString(database));
-            await connection.OpenAsync();
-
+            await using var connection = new SqlConnection(GetConnectionString(database));
             // Get estimated execution plan
             var planResult = new QueryPlanResult
             {
@@ -46,27 +43,17 @@ public partial class DatabaseServiceBase
             };
 
             // Enable SHOWPLAN_XML to get detailed execution plan
-            await using (var planCommand = new SqlCommand("SET SHOWPLAN_XML ON", connection))
-            {
-                await planCommand.ExecuteNonQueryAsync();
-            }
+            await connection.ExecuteAsync("SET SHOWPLAN_XML ON");
 
             try
             {
-                await using var command = new SqlCommand(query, connection);
-                command.CommandTimeout = 30;
-
-                using var reader = await command.ExecuteReaderAsync();
-                if (await reader.ReadAsync())
-                {
-                    planResult.ExecutionPlan = reader.GetString(0);
-                }
+                planResult.ExecutionPlan =
+                    await connection.QuerySingleOrDefaultAsync<string>(query, commandTimeout: 30);
             }
             finally
             {
                 // Always turn off SHOWPLAN_XML
-                await using var offCommand = new SqlCommand("SET SHOWPLAN_XML OFF", connection);
-                await offCommand.ExecuteNonQueryAsync();
+                await connection.ExecuteAsync("SET SHOWPLAN_XML OFF");
             }
 
             // Parse basic plan information
@@ -77,13 +64,13 @@ public partial class DatabaseServiceBase
             }
 
             planResult.Message = "Execution plan retrieved successfully";
-            _logger.LogInformation("Generated execution plan for query in database {Database}", database ?? "default");
+            logger.LogInformation("Generated execution plan for query in database {Database}", database ?? "default");
 
             return planResult;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error generating execution plan for query in database {Database}", database);
+            logger.LogError(ex, "Error generating execution plan for query in database {Database}", database);
             return new QueryPlanResult
             {
                 Success = false,
@@ -94,7 +81,7 @@ public partial class DatabaseServiceBase
     }
 
     /// <summary>
-    /// Validate SQL syntax and check for potential issues without execution
+    ///     Validate SQL syntax and check for potential issues without execution
     /// </summary>
     /// <param name="query">The SQL query to validate</param>
     /// <param name="database">Optional database name</param>
@@ -103,9 +90,7 @@ public partial class DatabaseServiceBase
     {
         try
         {
-            using var connection = new SqlConnection(GetConnectionString(database));
-            await connection.OpenAsync();
-
+            await using var connection = new SqlConnection(GetConnectionString(database));
             var result = new QueryValidationResult();
 
             // Basic safety check
@@ -117,17 +102,11 @@ public partial class DatabaseServiceBase
             }
 
             // Syntax validation using SET PARSEONLY
-            await using (var parseCommand = new SqlCommand("SET PARSEONLY ON", connection))
-            {
-                await parseCommand.ExecuteNonQueryAsync();
-            }
+            await connection.ExecuteAsync("SET PARSEONLY ON");
 
             try
             {
-                await using var command = new SqlCommand(query, connection);
-                command.CommandTimeout = 10; // Short timeout for validation
-                await command.ExecuteNonQueryAsync();
-
+                await connection.ExecuteAsync(query, commandTimeout: 10);
                 // If we get here, syntax is valid
                 result.IsValid = true;
                 result.Message = "Query syntax is valid";
@@ -141,8 +120,7 @@ public partial class DatabaseServiceBase
             finally
             {
                 // Always turn off PARSEONLY
-                await using var offCommand = new SqlCommand("SET PARSEONLY OFF", connection);
-                await offCommand.ExecuteNonQueryAsync();
+                await connection.ExecuteAsync("SET PARSEONLY OFF");
             }
 
             // Analyze query complexity
@@ -150,23 +128,19 @@ public partial class DatabaseServiceBase
 
             // Add complexity-based warnings
             if (result.Complexity.ComplexityLevel == "VeryComplex")
-            {
                 result.Warnings.Add("Query is very complex and may have performance implications");
-            }
 
             if (result.Complexity.JoinCount > 5)
-            {
                 result.Warnings.Add($"Query contains {result.Complexity.JoinCount} joins which may impact performance");
-            }
 
-            _logger.LogInformation("Validated query syntax for database {Database}, IsValid: {IsValid}",
+            logger.LogInformation("Validated query syntax for database {Database}, IsValid: {IsValid}",
                 database ?? "default", result.IsValid);
 
             return result;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error validating query for database {Database}", database);
+            logger.LogError(ex, "Error validating query for database {Database}", database);
             return new QueryValidationResult
             {
                 IsValid = false,
@@ -177,7 +151,7 @@ public partial class DatabaseServiceBase
     }
 
     /// <summary>
-    /// Estimate query execution cost and resource usage
+    ///     Estimate query execution cost and resource usage
     /// </summary>
     /// <param name="query">The SQL query to analyze</param>
     /// <param name="database">Optional database name</param>
@@ -189,24 +163,17 @@ public partial class DatabaseServiceBase
             // First validate the query is safe
             var safetyCheck = await ValidateQuerySafetyAsync(query);
             if (!safetyCheck.IsSafe)
-            {
                 return new QueryCostResult
                 {
                     Success = false,
                     Message = $"Query safety validation failed: {safetyCheck.Message}"
                 };
-            }
 
-            using var connection = new SqlConnection(GetConnectionString(database));
-            await connection.OpenAsync();
-
+            await using var connection = new SqlConnection(GetConnectionString(database));
             var result = new QueryCostResult { Success = true };
 
             // Enable statistics to get cost information
-            await using (var statsCommand = new SqlCommand("SET STATISTICS IO ON; SET STATISTICS TIME ON;", connection))
-            {
-                await statsCommand.ExecuteNonQueryAsync();
-            }
+            await connection.ExecuteAsync("SET STATISTICS IO ON; SET STATISTICS TIME ON;");
 
             // Get execution plan for cost estimation
             var planResult = await ExplainQueryAsync(query, database);
@@ -216,17 +183,11 @@ public partial class DatabaseServiceBase
 
                 // Estimate resource usage based on cost
                 if (result.EstimatedCost < 1)
-                {
                     result.ResourceUsage = "Low";
-                }
                 else if (result.EstimatedCost < 10)
-                {
                     result.ResourceUsage = "Medium";
-                }
                 else if (result.EstimatedCost < 100)
-                {
                     result.ResourceUsage = "High";
-                }
                 else
                 {
                     result.ResourceUsage = "Very High";
@@ -238,30 +199,24 @@ public partial class DatabaseServiceBase
             var complexity = AnalyzeQueryComplexity(query);
 
             if (complexity.JoinCount > 3)
-            {
                 result.Recommendations.Add("Consider adding appropriate indexes for join operations");
-            }
 
             if (complexity.SubqueryCount > 2)
-            {
                 result.Recommendations.Add("Consider rewriting subqueries as CTEs or joins for better performance");
-            }
 
             if (query.ToUpperInvariant().Contains("SELECT *"))
-            {
                 result.Recommendations.Add("Avoid SELECT * and specify only required columns");
-            }
 
             result.Message = $"Cost estimation completed. Estimated cost: {result.EstimatedCost}";
 
-            _logger.LogInformation("Estimated query cost: {Cost} for database {Database}",
+            logger.LogInformation("Estimated query cost: {Cost} for database {Database}",
                 result.EstimatedCost, database ?? "default");
 
             return result;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error estimating query cost for database {Database}", database);
+            logger.LogError(ex, "Error estimating query cost for database {Database}", database);
             return new QueryCostResult
             {
                 Success = false,
@@ -271,7 +226,7 @@ public partial class DatabaseServiceBase
     }
 
     /// <summary>
-    /// Execute a query with detailed statistics and performance metrics
+    ///     Execute a query with detailed statistics and performance metrics
     /// </summary>
     /// <param name="query">The SQL query to execute</param>
     /// <param name="database">Optional database name</param>
@@ -287,59 +242,38 @@ public partial class DatabaseServiceBase
             // First validate the query is safe
             var safetyCheck = await ValidateQuerySafetyAsync(query);
             if (!safetyCheck.IsSafe)
-            {
                 return new EnhancedQueryResult
                 {
                     Success = false,
                     Message = $"Query safety validation failed: {safetyCheck.Message}",
                     ActualExecutionTime = stopwatch.Elapsed
                 };
-            }
 
-            using var connection = new SqlConnection(GetConnectionString(database));
-            await connection.OpenAsync();
-
+            await using var connection = new SqlConnection(GetConnectionString(database));
             var result = new EnhancedQueryResult();
 
             // Enable statistics collection
-            await using (var statsCommand = new SqlCommand(
-                             "SET STATISTICS IO ON; SET STATISTICS TIME ON; SET STATISTICS PROFILE ON;", connection))
-            {
-                await statsCommand.ExecuteNonQueryAsync();
-            }
+            await connection.ExecuteAsync("SET STATISTICS IO ON; SET STATISTICS TIME ON; SET STATISTICS PROFILE ON;");
 
             try
             {
-                await using var command = new SqlCommand(query, connection);
-                command.CommandTimeout = 60; // Longer timeout for stats collection
-
-                using var reader = await command.ExecuteReaderAsync();
-
-                // Collect column information
+                var data = (await connection.QueryAsync(query, commandTimeout: 60))
+                    .Take(maxRows)
+                    .ToList();
                 var columns = new List<string>();
-                for (var i = 0; i < reader.FieldCount; i++)
-                {
-                    columns.Add(reader.GetName(i));
-                }
-
-                // Collect row data
                 var rows = new List<Dictionary<string, object?>>();
-                var rowCount = 0;
 
-                while (await reader.ReadAsync() && rowCount < maxRows)
+                if (data.Any())
                 {
-                    var row = new Dictionary<string, object?>();
-                    for (var i = 0; i < reader.FieldCount; i++)
-                    {
-                        row[columns[i]] = reader.IsDBNull(i) ? null : reader.GetValue(i);
-                    }
+                    var firstRow = (IDictionary<string, object?>)data.First();
+                    columns.AddRange(firstRow.Keys);
 
-                    rows.Add(row);
-                    rowCount++;
+                    rows = data.Select(r => new Dictionary<string, object?>((IDictionary<string, object?>)r)).ToList();
                 }
 
                 // Apply PII filtering
-                var filteredRows = _piiFilterService.FilterRows(rows);
+                var filteredRows = piiFilterService.FilterRows(rows);
+                var rowCount = filteredRows.Count;
 
                 // Populate result
                 result.Success = true;
@@ -351,18 +285,14 @@ public partial class DatabaseServiceBase
 
                 // Add performance warnings
                 if (result.ExecutionTime.TotalSeconds > 5)
-                {
                     result.PerformanceWarnings = "Query took longer than 5 seconds to execute";
-                }
                 else if (result.ExecutionTime.TotalSeconds > 1)
-                {
                     result.PerformanceWarnings = "Query execution time is elevated";
-                }
 
                 result.Message = $"Retrieved {rowCount} rows in {result.ExecutionTime.TotalMilliseconds:F0}ms" +
                                  (result.WasTruncated ? $" (limited to {maxRows} rows)" : "") + " (PII filtered)";
 
-                _logger.LogInformation("Executed query with stats: {RowCount} rows in {ExecutionTime}ms",
+                logger.LogInformation("Executed query with stats: {RowCount} rows in {ExecutionTime}ms",
                     rowCount, result.ExecutionTime.TotalMilliseconds);
             }
             finally
@@ -370,13 +300,12 @@ public partial class DatabaseServiceBase
                 // Turn off statistics
                 try
                 {
-                    await using var offCommand = new SqlCommand(
-                        "SET STATISTICS IO OFF; SET STATISTICS TIME OFF; SET STATISTICS PROFILE OFF;", connection);
-                    await offCommand.ExecuteNonQueryAsync();
+                    await connection.ExecuteAsync(
+                        "SET STATISTICS IO OFF; SET STATISTICS TIME OFF; SET STATISTICS PROFILE OFF;");
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "Failed to turn off statistics collection");
+                    logger.LogWarning(ex, "Failed to turn off statistics collection");
                 }
             }
 
@@ -385,7 +314,7 @@ public partial class DatabaseServiceBase
         catch (Exception ex)
         {
             stopwatch.Stop();
-            _logger.LogError(ex, "Error executing query with stats for database {Database}", database);
+            logger.LogError(ex, "Error executing query with stats for database {Database}", database);
             return new EnhancedQueryResult
             {
                 Success = false,
@@ -399,72 +328,59 @@ public partial class DatabaseServiceBase
     }
 
     /// <summary>
-    /// Validate query safety by checking for dangerous operations
+    ///     Validate query safety by checking for dangerous operations
     /// </summary>
-    private async Task<QuerySafetyResult> ValidateQuerySafetyAsync(string query)
+    private Task<QuerySafetyResult> ValidateQuerySafetyAsync(string query)
     {
         var result = new QuerySafetyResult { IsSafe = true };
         var normalizedQuery = query.Trim().ToUpperInvariant();
 
         // Check for write operations
-        var writeOperations = new[] { "INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER", "TRUNCATE", "MERGE" };
+        string[] writeOperations =
+            ["INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER", "TRUNCATE", "MERGE"];
         foreach (var operation in writeOperations)
-        {
-            if (normalizedQuery.StartsWith(operation + " ") || normalizedQuery.Contains(" " + operation + " "))
+            if (normalizedQuery.StartsWith($"{operation} ") || normalizedQuery.Contains($" {operation} "))
             {
                 result.IsSafe = false;
                 result.ContainsWriteOperations = true;
                 result.Violations.Add($"Query contains write operation: {operation}");
             }
-        }
 
         // Check for dangerous functions
-        var dangerousFunctions = new[] { "xp_cmdshell", "sp_configure", "OPENROWSET", "OPENDATASOURCE" };
+        string[] dangerousFunctions = ["xp_cmdshell", "sp_configure", "OPENROWSET", "OPENDATASOURCE"];
         foreach (var function in dangerousFunctions)
-        {
             if (normalizedQuery.Contains(function.ToUpperInvariant()))
             {
                 result.IsSafe = false;
                 result.ContainsDangerousFunctions = true;
                 result.Violations.Add($"Query contains dangerous function: {function}");
             }
-        }
 
         // Check for potential SQL injection patterns
-        var injectionPatterns = new[]
-        {
+        string[] injectionPatterns =
+        [
             @";\s*(DROP|DELETE|INSERT|UPDATE)",
             @"UNION\s+SELECT",
             @"--\s*$",
             @"\/\*.*\*\/"
-        };
+        ];
 
         foreach (var pattern in injectionPatterns)
-        {
             if (Regex.IsMatch(normalizedQuery, pattern, RegexOptions.IgnoreCase))
-            {
                 result.Warnings.Add($"Potential SQL injection pattern detected: {pattern}");
-            }
-        }
 
         if (!result.IsSafe)
-        {
             result.Message = "Query contains unsafe operations";
-        }
         else if (result.Warnings.Any())
-        {
             result.Message = "Query passed safety check but has warnings";
-        }
         else
-        {
             result.Message = "Query is safe to execute";
-        }
 
-        return await Task.FromResult(result);
+        return Task.FromResult(result);
     }
 
     /// <summary>
-    /// Analyze query complexity for warnings and recommendations
+    ///     Analyze query complexity for warnings and recommendations
     /// </summary>
     private QueryComplexity AnalyzeQueryComplexity(string query)
     {
@@ -478,11 +394,9 @@ public partial class DatabaseServiceBase
         complexity.SubqueryCount = Regex.Matches(normalizedQuery, @"\(\s*SELECT\b").Count;
 
         // Count aggregates
-        var aggregateFunctions = new[] { "COUNT", "SUM", "AVG", "MIN", "MAX", "GROUP_CONCAT" };
+        string[] aggregateFunctions = ["COUNT", "SUM", "AVG", "MIN", "MAX", "GROUP_CONCAT"];
         foreach (var func in aggregateFunctions)
-        {
             complexity.AggregateCount += Regex.Matches(normalizedQuery, $@"\b{func}\s*\(").Count;
-        }
 
         // Check for window functions
         complexity.HasWindowFunctions = Regex.IsMatch(normalizedQuery, @"\bOVER\s*\(");
@@ -509,7 +423,7 @@ public partial class DatabaseServiceBase
     }
 
     /// <summary>
-    /// Extract estimated cost from XML execution plan
+    ///     Extract estimated cost from XML execution plan
     /// </summary>
     private decimal ExtractEstimatedCostFromPlan(string xmlPlan)
     {
@@ -517,21 +431,18 @@ public partial class DatabaseServiceBase
         {
             // Simple regex to extract StatementSubTreeCost from XML plan
             var match = Regex.Match(xmlPlan, @"StatementSubTreeCost=""([^""]+)""");
-            if (match.Success && decimal.TryParse(match.Groups[1].Value, out var cost))
-            {
-                return cost;
-            }
+            if (match.Success && decimal.TryParse(match.Groups[1].Value, out var cost)) return cost;
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Failed to extract cost from execution plan");
+            logger.LogWarning(ex, "Failed to extract cost from execution plan");
         }
 
         return 0;
     }
 
     /// <summary>
-    /// Extract key operators from XML execution plan
+    ///     Extract key operators from XML execution plan
     /// </summary>
     private List<PlanOperator> ExtractOperatorsFromPlan(string xmlPlan)
     {
@@ -544,7 +455,6 @@ public partial class DatabaseServiceBase
                 @"<RelOp.*?PhysicalOp=""([^""]+)"".*?EstimateCPU=""([^""]+)"".*?EstimateRows=""([^""]+)""");
 
             foreach (Match match in operatorMatches)
-            {
                 if (match.Groups.Count >= 4)
                 {
                     var op = new PlanOperator
@@ -555,11 +465,10 @@ public partial class DatabaseServiceBase
                     };
                     operators.Add(op);
                 }
-            }
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Failed to extract operators from execution plan");
+            logger.LogWarning(ex, "Failed to extract operators from execution plan");
         }
 
         return operators;

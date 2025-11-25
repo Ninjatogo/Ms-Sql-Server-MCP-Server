@@ -1,4 +1,4 @@
-﻿using System.Data;
+using Dapper;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
@@ -7,71 +7,37 @@ using ServerCore.Models;
 
 namespace ServerCore.Services;
 
-public partial class DatabaseServiceBase : IDatabaseService
+public partial class DatabaseServiceBase(
+    IConfiguration configuration,
+    ILogger<DatabaseServiceBase> logger,
+    IPiiFilterService piiFilterService) : IDatabaseService
 {
-    private readonly IConfiguration _configuration;
-    private readonly ILogger<DatabaseServiceBase> _logger;
-    private readonly IPiiFilterService _piiFilterService;
-
-    /// <summary>
-    /// Partial class implementing Core Query Capabilities for the DatabaseService
-    /// These methods provide advanced query analysis, validation, and execution features
-    /// </summary>
-    public DatabaseServiceBase(IConfiguration configuration, 
-        ILogger<DatabaseServiceBase> logger,
-        IPiiFilterService piiFilterService)
-    {
-        _configuration = configuration;
-        _logger = logger;
-        _piiFilterService = piiFilterService;
-    }
-
     private string GetConnectionString(string? database = null)
     {
-        var baseConnectionString = _configuration.GetConnectionString("DefaultConnection") 
-            ?? throw new InvalidOperationException("DefaultConnection string not found in configuration");
+        var baseConnectionString = configuration.GetConnectionString("DefaultConnection")
+                                   ?? throw new InvalidOperationException("DefaultConnection string not found in configuration");
 
-        if (!string.IsNullOrEmpty(database))
+        if (string.IsNullOrEmpty(database)) return baseConnectionString;
+
+        var builder = new SqlConnectionStringBuilder(baseConnectionString)
         {
-            var builder = new SqlConnectionStringBuilder(baseConnectionString)
-            {
-                InitialCatalog = database
-            };
-            return builder.ConnectionString;
-        }
-
-        return baseConnectionString;
+            InitialCatalog = database
+        };
+        return builder.ConnectionString;
     }
 
     public async Task<List<string>> GetDatabasesAsync()
     {
         try
         {
-            using var connection = new SqlConnection(GetConnectionString());
-            await connection.OpenAsync();
-
-            const string query = """
-                                     SELECT name 
-                                     FROM sys.databases 
-                                     WHERE name NOT IN ('master', 'tempdb', 'model', 'msdb')
-                                     ORDER BY name
-                                 """;
-
-            using var command = new SqlCommand(query, connection);
-            using var reader = await command.ExecuteReaderAsync();
-
-            var databases = new List<string>();
-            while (await reader.ReadAsync())
-            {
-                databases.Add(reader.GetString(0));
-            }
-
-            _logger.LogInformation("Retrieved {Count} databases", databases.Count);
+            await using var connection = new SqlConnection(GetConnectionString());
+            var databases = (await connection.QueryAsync<string>(SqlQueries.GetDatabases)).ToList();
+            logger.LogInformation("Retrieved {Count} databases", databases.Count);
             return databases;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error retrieving databases");
+            logger.LogError(ex, "Error retrieving databases");
             throw;
         }
     }
@@ -80,32 +46,15 @@ public partial class DatabaseServiceBase : IDatabaseService
     {
         try
         {
-            using var connection = new SqlConnection(GetConnectionString(database));
-            await connection.OpenAsync();
-
-            const string query = """
-                                     SELECT TABLE_NAME 
-                                     FROM INFORMATION_SCHEMA.TABLES 
-                                     WHERE TABLE_TYPE = 'BASE TABLE'
-                                     ORDER BY TABLE_NAME
-                                 """;
-
-            using var command = new SqlCommand(query, connection);
-            using var reader = await command.ExecuteReaderAsync();
-
-            var tables = new List<string>();
-            while (await reader.ReadAsync())
-            {
-                tables.Add(reader.GetString(0));
-            }
-
-            _logger.LogInformation("Retrieved {Count} tables from database {Database}", 
+            await using var connection = new SqlConnection(GetConnectionString(database));
+            var tables = (await connection.QueryAsync<string>(SqlQueries.GetTables)).ToList();
+            logger.LogInformation("Retrieved {Count} tables from database {Database}",
                 tables.Count, database ?? "default");
             return tables;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error retrieving tables from database {Database}", database);
+            logger.LogError(ex, "Error retrieving tables from database {Database}", database);
             throw;
         }
     }
@@ -114,61 +63,41 @@ public partial class DatabaseServiceBase : IDatabaseService
     {
         try
         {
-            using var connection = new SqlConnection(GetConnectionString(database));
-            await connection.OpenAsync();
+            await using var connection = new SqlConnection(GetConnectionString(database));
+            var schemaData = await connection.QueryAsync<dynamic>(
+                SqlQueries.GetTableSchema, new { TableName = tableName });
 
-            const string query = """
-                                     SELECT 
-                                         COLUMN_NAME,
-                                         DATA_TYPE,
-                                         IS_NULLABLE,
-                                         CHARACTER_MAXIMUM_LENGTH,
-                                         NUMERIC_PRECISION,
-                                         NUMERIC_SCALE,
-                                         COLUMN_DEFAULT
-                                     FROM INFORMATION_SCHEMA.COLUMNS
-                                     WHERE TABLE_NAME = @TableName
-                                     ORDER BY ORDINAL_POSITION
-                                 """;
-
-            using var command = new SqlCommand(query, connection);
-            command.Parameters.Add("@TableName", SqlDbType.NVarChar).Value = tableName;
-            using var reader = await command.ExecuteReaderAsync();
-
-            var columns = new List<TableColumn>();
-            while (await reader.ReadAsync())
+            var columns = schemaData.Select(row =>
             {
-                var columnName = reader.GetString("COLUMN_NAME");
-                var column = new TableColumn
+                var columnName = (string)row.COLUMN_NAME;
+                return new TableColumn
                 {
                     ColumnName = columnName,
-                    DataType = reader.GetString("DATA_TYPE"),
-                    IsNullable = reader.GetString("IS_NULLABLE") == "YES",
-                    MaxLength = reader.IsDBNull("CHARACTER_MAXIMUM_LENGTH") ? null : GetSafeInt32(reader, "CHARACTER_MAXIMUM_LENGTH"),
-                    NumericPrecision = reader.IsDBNull("NUMERIC_PRECISION") ? null : reader.GetByte("NUMERIC_PRECISION"),
-                    NumericScale = reader.IsDBNull("NUMERIC_SCALE") ? null : GetSafeInt32(reader, "NUMERIC_SCALE"),
-                    DefaultValue = reader.IsDBNull("COLUMN_DEFAULT") ? null : reader.GetString("COLUMN_DEFAULT"),
-                    IsSensitive = _piiFilterService.IsSensitiveColumn(columnName) // Mark sensitive columns
+                    DataType = row.DATA_TYPE,
+                    IsNullable = string.Equals(row.IS_NULLABLE, "YES", StringComparison.OrdinalIgnoreCase),
+                    MaxLength = (int?)row.CHARACTER_MAXIMUM_LENGTH,
+                    NumericPrecision = (byte?)row.NUMERIC_PRECISION,
+                    NumericScale = (int?)row.NUMERIC_SCALE,
+                    DefaultValue = row.COLUMN_DEFAULT,
+                    IsSensitive = piiFilterService.IsSensitiveColumn(columnName)
                 };
-                
-                columns.Add(column);
-            }
+            }).ToList();
 
-            _logger.LogInformation("Retrieved schema for table {TableName} with {Count} columns", 
+            logger.LogInformation("Retrieved schema for table {TableName} with {Count} columns",
                 tableName, columns.Count);
-            
+
             var sensitiveCount = columns.Count(c => c.IsSensitive);
             if (sensitiveCount > 0)
             {
-                _logger.LogWarning("Table {TableName} contains {SensitiveCount} potentially sensitive columns", 
+                logger.LogWarning("Table {TableName} contains {SensitiveCount} potentially sensitive columns",
                     tableName, sensitiveCount);
             }
-            
+
             return columns;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error retrieving schema for table {TableName} in database {Database}", 
+            logger.LogError(ex, "Error retrieving schema for table {TableName} in database {Database}",
                 tableName, database);
             throw;
         }
@@ -178,52 +107,40 @@ public partial class DatabaseServiceBase : IDatabaseService
     {
         try
         {
-            using var connection = new SqlConnection(GetConnectionString(database));
-            await connection.OpenAsync();
-
-            using var command = new SqlCommand(query, connection);
-            command.CommandTimeout = 30; // 30 seconds timeout
-
-            using var reader = await command.ExecuteReaderAsync();
+            await using var connection = new SqlConnection(GetConnectionString(database));
+            var data = (await connection.QueryAsync(query, commandTimeout: 30)).Take(maxRows).ToList();
 
             var columns = new List<string>();
-            for (var i = 0; i < reader.FieldCount; i++)
-            {
-                columns.Add(reader.GetName(i));
-            }
-
             var rows = new List<Dictionary<string, object?>>();
-            var rowCount = 0;
 
-            while (await reader.ReadAsync() && rowCount < maxRows)
+            if (data.Any())
             {
-                var row = new Dictionary<string, object?>();
-                for (var i = 0; i < reader.FieldCount; i++)
-                {
-                    row[columns[i]] = reader.IsDBNull(i) ? null : reader.GetValue(i);
-                }
-                rows.Add(row);
-                rowCount++;
+                var firstRow = (IDictionary<string, object?>)data.First();
+                columns.AddRange(firstRow.Keys);
+
+                rows = data.Select(r => new Dictionary<string, object?>((IDictionary<string, object?>)r)).ToList();
             }
 
-            // Apply PII filtering to the results
-            var filteredRows = _piiFilterService.FilterRows(rows);
+            var filteredRows = piiFilterService.FilterRows(rows);
+            var rowCount = filteredRows.Count;
 
             var result = new DatabaseQueryResult
             {
                 Success = true,
                 Columns = columns,
-                Rows = filteredRows, // Use filtered rows instead of original
+                Rows = filteredRows,
                 RowCount = rowCount,
-                Message = rowCount >= maxRows ? $"Results limited to {maxRows} rows (PII filtered)" : $"Retrieved {rowCount} rows (PII filtered)"
+                Message = rowCount >= maxRows
+                    ? $"Results limited to {maxRows} rows (PII filtered)"
+                    : $"Retrieved {rowCount} rows (PII filtered)"
             };
 
-            _logger.LogInformation("Executed query successfully, returned {Count} rows with PII filtering applied", rowCount);
+            logger.LogInformation("Executed query successfully, returned {Count} rows with PII filtering applied", rowCount);
             return result;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error executing query: {Query}", query);
+            logger.LogError(ex, "Error executing query: {Query}", query);
             return new DatabaseQueryResult
             {
                 Success = false,
@@ -239,13 +156,8 @@ public partial class DatabaseServiceBase : IDatabaseService
     {
         try
         {
-            using var connection = new SqlConnection(GetConnectionString(database));
-            await connection.OpenAsync();
-
-            using var sqlCommand = new SqlCommand(command, connection);
-            sqlCommand.CommandTimeout = 30;
-
-            var rowsAffected = await sqlCommand.ExecuteNonQueryAsync();
+            await using var connection = new SqlConnection(GetConnectionString(database));
+            var rowsAffected = await connection.ExecuteAsync(command, commandTimeout: 30);
 
             var result = new DatabaseQueryResult
             {
@@ -256,12 +168,12 @@ public partial class DatabaseServiceBase : IDatabaseService
                 RowCount = rowsAffected
             };
 
-            _logger.LogInformation("Executed non-query command successfully, {RowsAffected} rows affected", rowsAffected);
+            logger.LogInformation("Executed non-query command successfully, {RowsAffected} rows affected", rowsAffected);
             return result;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error executing non-query command: {Command}", command);
+            logger.LogError(ex, "Error executing non-query command: {Command}", command);
             return new DatabaseQueryResult
             {
                 Success = false,
@@ -271,71 +183,5 @@ public partial class DatabaseServiceBase : IDatabaseService
                 RowCount = 0
             };
         }
-    }
-    
-    /// <summary>
-    /// Safe method to get decimal value from SqlDataReader with proper type conversion
-    /// </summary>
-    private static decimal GetSafeDecimal(SqlDataReader reader, string columnName)
-    {
-        if (reader.IsDBNull(columnName))
-            return 0;
-
-        var value = reader[columnName];
-        return value switch
-        {
-            decimal d => d,
-            double dbl => (decimal)dbl,
-            float f => (decimal)f,
-            long l => l,
-            int i => i,
-            short s => s,
-            byte b => b,
-            _ => Convert.ToDecimal(value)
-        };
-    }
-
-    /// <summary>
-    /// Safe method to get int32 value from SqlDataReader with proper type conversion
-    /// </summary>
-    private static int GetSafeInt32(SqlDataReader reader, string columnName)
-    {
-        if (reader.IsDBNull(columnName))
-            return 0;
-
-        var value = reader[columnName];
-        return value switch
-        {
-            int i => i,
-            long l => (int)l,
-            short s => s,
-            byte b => b,
-            decimal d => (int)d,
-            double dbl => (int)dbl,
-            float f => (int)f,
-            _ => Convert.ToInt32(value)
-        };
-    }
-
-    /// <summary>
-    /// Safe method to get int64 value from SqlDataReader with proper type conversion
-    /// </summary>
-    private static long GetSafeInt64(SqlDataReader reader, string columnName)
-    {
-        if (reader.IsDBNull(columnName))
-            return 0;
-
-        var value = reader[columnName];
-        return value switch
-        {
-            long l => l,
-            int i => i,
-            short s => s,
-            byte b => b,
-            decimal d => (long)d,
-            double dbl => (long)dbl,
-            float f => (long)f,
-            _ => Convert.ToInt64(value)
-        };
     }
 }
